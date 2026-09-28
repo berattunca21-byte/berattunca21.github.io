@@ -1,0 +1,338 @@
+//@version=6
+strategy(
+     title              = "BB MTF Reversal | Alt/Üst Bant Sapması",
+     shorttitle         = "BB MTF Rev",
+     overlay            = true,
+     pyramiding         = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick = false,
+     initial_capital    = 10000,
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 10,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.04,
+     max_labels_count   = 200,
+     max_bars_back      = 5000
+ )
+
+//──────────────────────────────────────────────
+// GİRİŞLER
+//──────────────────────────────────────────────
+grpBB   = "Bollinger Bantları"
+bbLen   = input.int(20,    "Periyot",            minval = 1,  group = grpBB)
+bbMult  = input.float(2.0, "Sapma (StdDev)",     minval = 0.1, step = 0.1, group = grpBB)
+bbOff   = input.int(0,     "Kayma (Offset)",     group = grpBB)
+bbSrc   = input.source(close, "Kaynak",          group = grpBB)
+
+grpSig  = "Sinyal Ayarları"
+useBody = input.bool(true,  "Ana mum yönü zorunlu (Sell gövde → Buy, Buy gövde → Sell)", group = grpSig)
+useCross = input.bool(true, "Ana TF'de bant kırılımı 'cross' olsun (kapatırsa geçer)", group = grpSig)
+requireConfirmed = input.bool(true, "Sadece kapanmış mumda sinyal üret", group = grpSig)
+showLabels = input.bool(true, "Grafikte metin etiketi göster", group = grpSig)
+showTable  = input.bool(true, "Bilgi tablosu göster", group = grpSig)
+
+grpRsi  = "Üst TF RSI Filtresi"
+rsiLen  = input.int(14, "RSI Periyot",                      minval = 1, group = grpRsi)
+atrLen  = input.int(14, "ATR Periyot (mum boyu kıyaslama)", minval = 1, group = grpRsi)
+
+grpVis  = "Görseller"
+showBB  = input.bool(true, "Ana TF Bollinger çiz", group = grpVis)
+buyClr  = input.color(color.new(#00e676, 0), "Buy rengi",  group = grpVis)
+sellClr = input.color(color.new(#ff1744, 0), "Sell rengi", group = grpVis)
+
+//──────────────────────────────────────────────
+// ALT ZAMAN DİLİMİ EŞLEMESİ
+// Grafik TF = ANA mum. Bir alt TF otomatik seçilir.
+// M5→M1 | M15→M5 | M30→M15 | H1→M30 | H4→H1 | D1→H4 | W1→D1
+//──────────────────────────────────────────────
+getLowerTf() =>
+    string tf = timeframe.period
+    string out = switch tf
+        "1"   => "1"
+        "3"   => "1"
+        "5"   => "1"
+        "15"  => "5"
+        "30"  => "15"
+        "45"  => "15"
+        "60"  => "30"
+        "120" => "60"
+        "180" => "60"
+        "240" => "60"
+        "D"   => "240"
+        "2D"  => "D"
+        "3D"  => "D"
+        "W"   => "D"
+        "2W"  => "W"
+        "M"   => "W"
+        => "5"
+    out
+
+lowerTf = getLowerTf()
+
+supportedAna =
+     timeframe.period == "5"  or
+     timeframe.period == "15" or
+     timeframe.period == "30" or
+     timeframe.period == "60" or
+     timeframe.period == "240" or
+     timeframe.period == "D"  or
+     timeframe.period == "W"
+
+//──────────────────────────────────────────────
+// ÜST ZAMAN DİLİMİ EŞLEMESİ (RSI filtresi için)
+// Merdiven: M1 → M5 → M15 → M30 → H1 → H4 → D1 → W1 → 1Ay → 3Ay → 12Ay
+// Ana H1 → 1 üst = H4, 2 üst = D1  |  Ana M15 → 1 üst = M30, 2 üst = H1
+// Saniye ile karşılaştırılır; "D" / "1D" yazım farkından etkilenmez.
+//──────────────────────────────────────────────
+getUpperTf(simple string tf) =>
+    int s = timeframe.in_seconds(tf)
+    string out = s < 300     ? "5"   :
+                 s < 900     ? "15"  :
+                 s < 1800    ? "30"  :
+                 s < 3600    ? "60"  :
+                 s < 14400   ? "240" :
+                 s < 86400   ? "D"   :
+                 s < 604800  ? "W"   :
+                 s < 2628003 ? "M"   :
+                 s < 7884009 ? "3M"  : "12M"
+    out
+
+upper1Tf = getUpperTf(timeframe.period)
+upper2Tf = getUpperTf(upper1Tf)
+
+//──────────────────────────────────────────────
+// ANA TF (grafik) BOLLINGER
+//──────────────────────────────────────────────
+[bbMid, bbUpper, bbLower] = ta.bb(bbSrc, bbLen, bbMult)
+
+plot(showBB ? bbMid   : na, "BB Orta",  color = color.new(color.orange, 0), linewidth = 1, offset = bbOff)
+plot(showBB ? bbUpper : na, "BB Üst",   color = color.new(color.teal, 0),   linewidth = 2, offset = bbOff)
+plot(showBB ? bbLower : na, "BB Alt",   color = color.new(color.teal, 0),   linewidth = 2, offset = bbOff)
+fill(plot(showBB ? bbUpper : na, display = display.none),
+     plot(showBB ? bbLower : na, display = display.none),
+     color.new(color.teal, 88), title = "BB Alan")
+
+//──────────────────────────────────────────────
+// ALT TF VERİSİ  (son mum = o HTF bar içindeki son LTF bar)
+// lookahead_off → geçmişte gelecek sızdırmaz, son LTF kapanışını verir
+//──────────────────────────────────────────────
+[ltfMid, ltfUpper, ltfLower] = request.security(
+     syminfo.tickerid,
+     lowerTf,
+     ta.bb(close, bbLen, bbMult),
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+ )
+
+ltfClose = request.security(
+     syminfo.tickerid,
+     lowerTf,
+     close,
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+ )
+
+ltfOpen = request.security(
+     syminfo.tickerid,
+     lowerTf,
+     open,
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+ )
+
+// Alt TF son mumun fitil dahil boyu (high - low) ve kendi TF'sinin ATR'si
+// (ATR[1] → ölçülen mumun kendisi ATR'ye karışmaz)
+[ltfHigh, ltfLow, ltfAtr] = request.security(
+     syminfo.tickerid,
+     lowerTf,
+     [high, low, ta.atr(atrLen)[1]],
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+ )
+
+//──────────────────────────────────────────────
+// ÜST TF GÜNCEL RSI  (repaint etmez)
+// Üst TF'nin son KAPANMIŞ mumuna ait RSI ortalamaları (RMA) alınır,
+// üst TF'nin açık (henüz kapanmamış) mumunun kapanışı = ana mumun kapanışı
+// kabul edilerek RSI bir adım ilerletilir.
+// → Ana mum kapandığı anda H4 / D1 grafiğinde görünen güncel RSI rakamı.
+//   Geçmiş mumlarda ve canlıda aynı değeri verir (gelecek sızdırmaz).
+//──────────────────────────────────────────────
+liveUpperRsi(simple string tf, simple int len) =>
+    [prevUp, prevDn, prevClose] = request.security(
+         syminfo.tickerid,
+         tf,
+         [ta.rma(math.max(close - close[1], 0), len)[1], ta.rma(math.max(close[1] - close, 0), len)[1], close[1]],
+         gaps      = barmerge.gaps_off,
+         lookahead = barmerge.lookahead_on
+     )
+    float chg = close - prevClose
+    float a   = 1.0 / len
+    float up  = a * math.max(chg, 0)  + (1 - a) * prevUp
+    float dn  = a * math.max(-chg, 0) + (1 - a) * prevDn
+    dn == 0 ? 100.0 : up == 0 ? 0.0 : 100.0 - 100.0 / (1.0 + up / dn)
+
+rsiUpper1 = liveUpperRsi(upper1Tf, rsiLen)   // örn. ana H1 → H4 RSI
+rsiUpper2 = liveUpperRsi(upper2Tf, rsiLen)   // örn. ana H1 → D1 RSI
+
+//──────────────────────────────────────────────
+// KOŞULLAR
+// BUY :
+//   Ana mum sell yönünde kapanır VE kapanış BB alt çizgisini geçer
+//   VE alt TF son mum GÖVDESİ alt çizginin iç tarafında kalır (çizgiye değmez)
+// SELL:
+//   Ana mum buy yönünde kapanır VE kapanış BB üst çizgisini geçer
+//   VE alt TF son mum GÖVDESİ üst çizginin iç tarafında kalır (çizgiye değmez)
+//──────────────────────────────────────────────
+bearishBody = close < open
+bullishBody = close > open
+
+htfBreakDown = useCross ? ta.crossunder(close, bbLower) : close < bbLower
+htfBreakUp   = useCross ? ta.crossover(close, bbUpper)  : close > bbUpper
+
+ltfBodyLow  = math.min(ltfOpen, ltfClose)
+ltfBodyHigh = math.max(ltfOpen, ltfClose)
+ltfNotBelowLower   = not na(ltfOpen) and not na(ltfClose) and not na(ltfLower) and ltfBodyLow > ltfLower
+ltfStaysUnderUpper = not na(ltfOpen) and not na(ltfClose) and not na(ltfUpper) and ltfBodyHigh < ltfUpper
+
+bodyOkBuy  = useBody ? bearishBody : true
+bodyOkSell = useBody ? bullishBody : true
+
+barOk = requireConfirmed ? barstate.isconfirmed : true
+
+//──────────────────────────────────────────────
+// ÜST TF RSI FİLTRESİ
+// Mum boyu = fitil dahil (high - low), kendi TF'sinin ATR'sine bölünür.
+// Alt TF son mum zaman olarak ana mumun içinde olduğu için mutlak ya da
+// yüzde boyu hep ana mumdan küçük çıkar; ATR ile her mum kendi TF'sine
+// göre ölçülür ve "büyük / küçük" karşılaştırması anlamlı olur.
+//
+// 1) Alt TF son mum ana mumdan KÜÇÜK → 2 üst TF RSI, 1 üst TF RSI'nin İLERİSİNDE
+//      Ana mum buy kapanış  → D1 RSI > H4 RSI
+//      Ana mum sell kapanış → D1 RSI < H4 RSI
+// 2) Alt TF son mum ana mumdan BÜYÜK → 2 üst TF RSI, 1 üst TF RSI'nin GERİSİNDE
+//      Ana mum buy kapanış  → D1 RSI < H4 RSI
+//      Ana mum sell kapanış → D1 RSI > H4 RSI
+// (Örnekler ana TF = H1 içindir: 1 üst = H4, 2 üst = D1)
+//──────────────────────────────────────────────
+anaRel = (high - low) / ta.atr(atrLen)[1]
+ltfRel = (ltfHigh - ltfLow) / ltfAtr
+
+ltfSmaller = ltfRel < anaRel
+ltfBigger  = ltfRel > anaRel
+
+rsiAhead  = bullishBody ? rsiUpper2 > rsiUpper1 : bearishBody ? rsiUpper2 < rsiUpper1 : false
+rsiBehind = bullishBody ? rsiUpper2 < rsiUpper1 : bearishBody ? rsiUpper2 > rsiUpper1 : false
+
+rsiOk = (ltfSmaller and rsiAhead) or (ltfBigger and rsiBehind)
+
+buySignal  = barOk and bodyOkBuy  and htfBreakDown and ltfNotBelowLower   and rsiOk
+sellSignal = barOk and bodyOkSell and htfBreakUp   and ltfStaysUnderUpper and rsiOk
+
+//──────────────────────────────────────────────
+// STRATEJİ GİRİŞLERİ (test / backtest için)
+//──────────────────────────────────────────────
+if buySignal
+    strategy.entry("BUY", strategy.long, comment = "BUY BB-MTF")
+
+if sellSignal
+    strategy.entry("SELL", strategy.short, comment = "SELL BB-MTF")
+
+//──────────────────────────────────────────────
+// GÖRSELLER — geçmiş mumlar dahil
+//──────────────────────────────────────────────
+plotshape(
+     buySignal,
+     title     = "BUY",
+     style     = shape.labelup,
+     location  = location.belowbar,
+     color     = buyClr,
+     text      = "BUY",
+     textcolor = color.white,
+     size      = size.small
+ )
+
+plotshape(
+     sellSignal,
+     title     = "SELL",
+     style     = shape.labeldown,
+     location  = location.abovebar,
+     color     = sellClr,
+     text      = "SELL",
+     textcolor = color.white,
+     size      = size.small
+ )
+
+if showLabels and buySignal
+    label.new(
+         bar_index, low,
+         "BUY\nAna " + timeframe.period + " alt BB kırdı\nAlt " + lowerTf + " alt bandı geçmedi",
+         style     = label.style_label_up,
+         color     = color.new(buyClr, 20),
+         textcolor = color.white,
+         size      = size.small,
+         tooltip   = "Ana TF close=" + str.tostring(close, format.mintick) +
+                     " | BB Alt=" + str.tostring(bbLower, format.mintick) +
+                     "\nAlt TF close=" + str.tostring(ltfClose, format.mintick) +
+                     " | Alt TF BB Alt=" + str.tostring(ltfLower, format.mintick)
+     )
+
+if showLabels and sellSignal
+    label.new(
+         bar_index, high,
+         "SELL\nAna " + timeframe.period + " üst BB kırdı\nAlt " + lowerTf + " üst bandın altında",
+         style     = label.style_label_down,
+         color     = color.new(sellClr, 20),
+         textcolor = color.white,
+         size      = size.small,
+         tooltip   = "Ana TF close=" + str.tostring(close, format.mintick) +
+                     " | BB Üst=" + str.tostring(bbUpper, format.mintick) +
+                     "\nAlt TF close=" + str.tostring(ltfClose, format.mintick) +
+                     " | Alt TF BB Üst=" + str.tostring(ltfUpper, format.mintick)
+     )
+
+//──────────────────────────────────────────────
+// ALARM + MESAJ
+// TradingView: Alarm oluştur → Koşul: "Any alert() function call"
+// veya aşağıdaki alertcondition'ları seç.
+//──────────────────────────────────────────────
+buyMsg  = "BUY | " + syminfo.ticker + " | AnaTF=" + timeframe.period +
+          " AltTF=" + lowerTf +
+          " | Ana kapanış BB altını geçti, alt TF alt bandı geçmedi" +
+          " | Fiyat=" + str.tostring(close, format.mintick)
+
+sellMsg = "SELL | " + syminfo.ticker + " | AnaTF=" + timeframe.period +
+          " AltTF=" + lowerTf +
+          " | Ana kapanış BB üstünü geçti, alt TF üst bandın altında kaldı" +
+          " | Fiyat=" + str.tostring(close, format.mintick)
+
+if buySignal
+    alert(buyMsg, alert.freq_once_per_bar_close)
+
+if sellSignal
+    alert(sellMsg, alert.freq_once_per_bar_close)
+
+alertcondition(buySignal,  title = "BB MTF BUY",  message = "BUY sinyali: Ana TF BB altını kırdı, alt TF teyit etmedi")
+alertcondition(sellSignal, title = "BB MTF SELL", message = "SELL sinyali: Ana TF BB üstünü kırdı, alt TF üst bandın altında")
+
+//──────────────────────────────────────────────
+// BİLGİ TABLOSU
+//──────────────────────────────────────────────
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 2, 8, bgcolor = color.new(#102027, 15), border_width = 1, border_color = color.new(color.white, 70))
+    table.cell(t, 0, 0, "BB MTF Reversal", text_color = color.white, text_size = size.small, bgcolor = color.new(#00695c, 0))
+    table.cell(t, 1, 0, supportedAna ? "Hazır" : "TF eşlemesi varsayılan", text_color = color.white, text_size = size.small, bgcolor = color.new(#00695c, 0))
+    table.cell(t, 0, 1, "Ana TF",           text_color = color.silver, text_size = size.small)
+    table.cell(t, 1, 1, timeframe.period,   text_color = color.white,  text_size = size.small)
+    table.cell(t, 0, 2, "Alt TF (son mum)", text_color = color.silver, text_size = size.small)
+    table.cell(t, 1, 2, lowerTf,            text_color = color.white,  text_size = size.small)
+    table.cell(t, 0, 3, "BB Ayar",          text_color = color.silver, text_size = size.small)
+    table.cell(t, 1, 3, str.tostring(bbLen) + " / " + str.tostring(bbMult) + " / kayma " + str.tostring(bbOff), text_color = color.white, text_size = size.small)
+    table.cell(t, 0, 4, "Ana BB Alt / Üst", text_color = color.silver, text_size = size.small)
+    table.cell(t, 1, 4, str.tostring(bbLower, format.mintick) + " / " + str.tostring(bbUpper, format.mintick), text_color = color.white, text_size = size.small)
+    table.cell(t, 0, 5, "Alt TF Close",     text_color = color.silver, text_size = size.small)
+    table.cell(t, 1, 5, str.tostring(ltfClose, format.mintick), text_color = color.white, text_size = size.small)
+    table.cell(t, 0, 6, "Alt TF BB Alt/Üst", text_color = color.silver, text_size = size.small)
+    table.cell(t, 1, 6, str.tostring(ltfLower, format.mintick) + " / " + str.tostring(ltfUpper, format.mintick), text_color = color.white, text_size = size.small)
+    table.cell(t, 0, 7, "Son sinyal",       text_color = color.silver, text_size = size.small)
+    table.cell(t, 1, 7, buySignal ? "BUY" : sellSignal ? "SELL" : "—", text_color = buySignal ? buyClr : sellSignal ? sellClr : color.gray, text_size = size.small)
