@@ -31,6 +31,10 @@ requireConfirmed = input.bool(true, "Sadece kapanmış mumda sinyal üret", grou
 showLabels = input.bool(true, "Grafikte metin etiketi göster", group = grpSig)
 showTable  = input.bool(true, "Bilgi tablosu göster", group = grpSig)
 
+grpRsi  = "Üst TF RSI Filtresi"
+rsiLen  = input.int(14, "RSI Periyot",                      minval = 1, group = grpRsi)
+atrLen  = input.int(14, "ATR Periyot (mum boyu kıyaslama)", minval = 1, group = grpRsi)
+
 grpVis  = "Görseller"
 showBB  = input.bool(true, "Ana TF Bollinger çiz", group = grpVis)
 buyClr  = input.color(color.new(#00e676, 0), "Buy rengi",  group = grpVis)
@@ -75,6 +79,28 @@ supportedAna =
      timeframe.period == "W"
 
 //──────────────────────────────────────────────
+// ÜST ZAMAN DİLİMİ EŞLEMESİ (RSI filtresi için)
+// Merdiven: M1 → M5 → M15 → M30 → H1 → H4 → D1 → W1 → 1Ay → 3Ay → 12Ay
+// Ana H1 → 1 üst = H4, 2 üst = D1  |  Ana M15 → 1 üst = M30, 2 üst = H1
+// Saniye ile karşılaştırılır; "D" / "1D" yazım farkından etkilenmez.
+//──────────────────────────────────────────────
+getUpperTf(simple string tf) =>
+    int s = timeframe.in_seconds(tf)
+    string out = s < 300     ? "5"   :
+                 s < 900     ? "15"  :
+                 s < 1800    ? "30"  :
+                 s < 3600    ? "60"  :
+                 s < 14400   ? "240" :
+                 s < 86400   ? "D"   :
+                 s < 604800  ? "W"   :
+                 s < 2628003 ? "M"   :
+                 s < 7884009 ? "3M"  : "12M"
+    out
+
+upper1Tf = getUpperTf(timeframe.period)
+upper2Tf = getUpperTf(upper1Tf)
+
+//──────────────────────────────────────────────
 // ANA TF (grafik) BOLLINGER
 //──────────────────────────────────────────────
 [bbMid, bbUpper, bbLower] = ta.bb(bbSrc, bbLen, bbMult)
@@ -114,6 +140,41 @@ ltfOpen = request.security(
      lookahead = barmerge.lookahead_off
  )
 
+// Alt TF son mumun fitil dahil boyu (high - low) ve kendi TF'sinin ATR'si
+// (ATR[1] → ölçülen mumun kendisi ATR'ye karışmaz)
+[ltfHigh, ltfLow, ltfAtr] = request.security(
+     syminfo.tickerid,
+     lowerTf,
+     [high, low, ta.atr(atrLen)[1]],
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+ )
+
+//──────────────────────────────────────────────
+// ÜST TF GÜNCEL RSI  (repaint etmez)
+// Üst TF'nin son KAPANMIŞ mumuna ait RSI ortalamaları (RMA) alınır,
+// üst TF'nin açık (henüz kapanmamış) mumunun kapanışı = ana mumun kapanışı
+// kabul edilerek RSI bir adım ilerletilir.
+// → Ana mum kapandığı anda H4 / D1 grafiğinde görünen güncel RSI rakamı.
+//   Geçmiş mumlarda ve canlıda aynı değeri verir (gelecek sızdırmaz).
+//──────────────────────────────────────────────
+liveUpperRsi(simple string tf, simple int len) =>
+    [prevUp, prevDn, prevClose] = request.security(
+         syminfo.tickerid,
+         tf,
+         [ta.rma(math.max(close - close[1], 0), len)[1], ta.rma(math.max(close[1] - close, 0), len)[1], close[1]],
+         gaps      = barmerge.gaps_off,
+         lookahead = barmerge.lookahead_on
+     )
+    float chg = close - prevClose
+    float a   = 1.0 / len
+    float up  = a * math.max(chg, 0)  + (1 - a) * prevUp
+    float dn  = a * math.max(-chg, 0) + (1 - a) * prevDn
+    dn == 0 ? 100.0 : up == 0 ? 0.0 : 100.0 - 100.0 / (1.0 + up / dn)
+
+rsiUpper1 = liveUpperRsi(upper1Tf, rsiLen)   // örn. ana H1 → H4 RSI
+rsiUpper2 = liveUpperRsi(upper2Tf, rsiLen)   // örn. ana H1 → D1 RSI
+
 //──────────────────────────────────────────────
 // KOŞULLAR
 // BUY :
@@ -139,8 +200,34 @@ bodyOkSell = useBody ? bullishBody : true
 
 barOk = requireConfirmed ? barstate.isconfirmed : true
 
-buySignal  = barOk and bodyOkBuy  and htfBreakDown and ltfNotBelowLower
-sellSignal = barOk and bodyOkSell and htfBreakUp   and ltfStaysUnderUpper
+//──────────────────────────────────────────────
+// ÜST TF RSI FİLTRESİ
+// Mum boyu = fitil dahil (high - low), kendi TF'sinin ATR'sine bölünür.
+// Alt TF son mum zaman olarak ana mumun içinde olduğu için mutlak ya da
+// yüzde boyu hep ana mumdan küçük çıkar; ATR ile her mum kendi TF'sine
+// göre ölçülür ve "büyük / küçük" karşılaştırması anlamlı olur.
+//
+// 1) Alt TF son mum ana mumdan KÜÇÜK → 2 üst TF RSI, 1 üst TF RSI'nin İLERİSİNDE
+//      Ana mum buy kapanış  → D1 RSI > H4 RSI
+//      Ana mum sell kapanış → D1 RSI < H4 RSI
+// 2) Alt TF son mum ana mumdan BÜYÜK → 2 üst TF RSI, 1 üst TF RSI'nin GERİSİNDE
+//      Ana mum buy kapanış  → D1 RSI < H4 RSI
+//      Ana mum sell kapanış → D1 RSI > H4 RSI
+// (Örnekler ana TF = H1 içindir: 1 üst = H4, 2 üst = D1)
+//──────────────────────────────────────────────
+anaRel = (high - low) / ta.atr(atrLen)[1]
+ltfRel = (ltfHigh - ltfLow) / ltfAtr
+
+ltfSmaller = ltfRel < anaRel
+ltfBigger  = ltfRel > anaRel
+
+rsiAhead  = bullishBody ? rsiUpper2 > rsiUpper1 : bearishBody ? rsiUpper2 < rsiUpper1 : false
+rsiBehind = bullishBody ? rsiUpper2 < rsiUpper1 : bearishBody ? rsiUpper2 > rsiUpper1 : false
+
+rsiOk = (ltfSmaller and rsiAhead) or (ltfBigger and rsiBehind)
+
+buySignal  = barOk and bodyOkBuy  and htfBreakDown and ltfNotBelowLower   and rsiOk
+sellSignal = barOk and bodyOkSell and htfBreakUp   and ltfStaysUnderUpper and rsiOk
 
 //──────────────────────────────────────────────
 // STRATEJİ GİRİŞLERİ (test / backtest için)
